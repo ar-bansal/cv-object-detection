@@ -95,15 +95,16 @@ class YoloV1(L.LightningModule):
     
 
     def localization_loss(self, predictions: torch.Tensor, ground_truth: torch.Tensor):
+        """
+        Calculate the localization loss for the predicted 
+        bounding box. 
+        """
+
         # self(x) shape is (batch_size, S * S * (B * 5 + C))
         num_samples = predictions.shape[0]
         outputs = torch.reshape(predictions, (num_samples, self.S, self.S, (self.B * 5 + self.C)))
         # shape = (batch_size, S, S, 5B + C)
-        
-        gt_confidence = ground_truth[..., 5:self.B * 5 + 1:self.B]
-        pred_confidence = outputs[..., 5:self.B * 5 + 1:self.B]
-
-
+    
         # Convert (x, y) to relative to image from relative to grid cell
         pred_bboxes = self._convert_yolo_to_absolute(outputs)
         true_bboxes = self._convert_yolo_to_absolute(ground_truth)
@@ -113,24 +114,38 @@ class YoloV1(L.LightningModule):
 
         # Get the box with the highest IoU with the ground truth box. 
         # Here, class does not matter
-        mask = torch.argmax(ious, dim=-1)
-        # Shape = (batch_size, S, S)
+        mask = torch.argmax(ious, dim=-1).unsqueeze(-1)
+        # Shape = (batch_size, S, S, 1)
 
-        pred_x = outputs[..., 0][mask]
-        pred_y = outputs[..., 1][mask]
-        true_x = ground_truth[..., 0][mask]
-        true_y = ground_truth[..., 1][mask]
+        pred_x = torch.gather(outputs[..., 0], dim=-1, index=mask)
+        pred_y = torch.gather(outputs[..., 1], dim=-1, index=mask)
+        true_x = torch.gather(ground_truth[..., 0], dim=-1, index=mask)
+        true_y = torch.gather(ground_truth[..., 1], dim=-1, index=mask)
 
         loc_loss_x = (true_x - pred_x)
         loc_loss_y = (true_y - pred_y)
 
+        center_loss = torch.norm(
+            torch.stack([loc_loss_x, loc_loss_y]), 
+            dim=0
+        ).sum()
 
+        ## Calculate loss for box dimensions
+        pred_w = torch.sqrt(torch.gather(outputs[..., 2], dim=-1, index=mask))
+        pred_h = torch.sqrt(torch.gather(outputs[..., 3], dim=-1, index=mask))
+        true_w = torch.sqrt(torch.gather(ground_truth[..., 2], dim=-1, index=mask))
+        true_h = torch.sqrt(torch.gather(ground_truth[..., 3], dim=-1, index=mask))
 
+        loc_loss_w = (true_w - pred_w)
+        loc_loss_h = (true_h - pred_h)
 
+        dimension_loss = torch.norm(
+            torch.stack([loc_loss_w, loc_loss_h]), 
+            dim=0
+        ).sum()
 
-
+        return self.lambda_coord * (center_loss + dimension_loss)
         
-
 
     def forward(self, x, *args, **kwargs):
         pass
@@ -141,10 +156,7 @@ class YoloV1(L.LightningModule):
         # TODO: ensure that y repeats the bbox locations
         outputs = self(x)
 
-        loc_loss = self.localization_loss(outputs, y)
-        conf_loss = self.confidence_loss(outputs, y)
-        prob_loss = self.class_probability_loss(outputs, y)
-        noobj_loss = self.no_object_loss(outputs, y)
+        localization_loss = self.localization_loss(outputs, y)
 
         # train_loss = (
         #     self.loc_loss_weight * loc_loss + 
