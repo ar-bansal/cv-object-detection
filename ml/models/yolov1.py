@@ -31,11 +31,12 @@ class YoloV1(L.LightningModule):
 
     def _convert_yolo_to_absolute(self, inputs):
         # Assuming that the inputs have already been converted to shape 
-        # (batch_size, S, S, 5B + C)
+        # (N, S, S, 5B + C)
         bbox_coords = inputs[..., :self.B * 5]
         bbox_coords = bbox_coords.view(bbox_coords.shape[0], self.S, self.S, self.B, 5)
+        # (N, S, S, B, 5)
 
-        # Shape = (batch_size, S, S, B, 1)
+        # Shape = (N, S, S, B)
         x_rel = bbox_coords[..., 0]
         y_rel = bbox_coords[..., 1]
         w_rel = bbox_coords[..., 2]
@@ -44,7 +45,7 @@ class YoloV1(L.LightningModule):
 
         grid_x = torch.arange(self.S).repeat(self.S, 1)
         grid_y = torch.arange(self.S).repeat(self.S, 1).T    
-        grid_x = grid_x.unsqueeze(0).unsqueeze(-1).expand_as(x_rel)  # Shape (batch, S, S, B)
+        grid_x = grid_x.unsqueeze(0).unsqueeze(-1).expand_as(x_rel)  # Shape (N, S, S, B)
         grid_y = grid_y.unsqueeze(0).unsqueeze(-1).expand_as(y_rel)
         
         # Get center coordinates
@@ -57,15 +58,15 @@ class YoloV1(L.LightningModule):
         ymax = y_abs + h_rel / 2
 
         bboxes = torch.stack([xmin, xmax, ymin, ymax], dim=-1)
-        # Shape = (batch_size, S, S, B, 4)
+        # Shape = (N, S, S, B, 4)
 
         return bboxes
     
 
     def _get_iou(self, pred, true):
-        # Assuming that the input is of shape (batch_size, S, S, B, 4)
+        # Assuming that the input is of shape (N, S, S, B, 4)
 
-        # Shape = (batch_size, S, S, B)
+        # Shape = (N, S, S, B)
         pred_xmin = pred[..., 0]
         pred_xmax = pred[..., 1]
         pred_ymin = pred[..., 2]
@@ -76,116 +77,107 @@ class YoloV1(L.LightningModule):
         true_ymin = true[..., 2]
         true_ymax = true[..., 3]
 
-        # Shape = (batch_size, S, S, B)
         intersection_xmin = torch.max(pred_xmin, true_xmin)
         intersection_ymin = torch.max(pred_ymin, true_ymin)
         intersection_xmax = torch.min(pred_xmax, true_xmax)
         intersection_ymax = torch.min(pred_ymax, true_ymax)
+        # Shape = (N, S, S, B)
 
-        # Shape = (batch_size, S, S, B)
         intersection_area = (intersection_xmax - intersection_xmin) * (intersection_ymax - intersection_ymin)
+        # Shape = (N, S, S, B)
 
         pred_area = (pred_xmax - pred_xmin) * (pred_ymax - pred_ymin)
         true_area = (true_xmax - true_xmin) * (true_ymax - true_ymin)
 
-        # Shape = (batch_size, S, S, B)
+        # Shape = (N, S, S, B)
         union_area = pred_area + true_area - intersection_area
 
-        return intersection_area / union_area
+        return intersection_area / (union_area + 1e-6)
     
 
-    def localization_loss(self, predictions: torch.Tensor, ground_truth: torch.Tensor, object_present: torch.Tensor):
+    def _localization_loss(self, predictions: torch.Tensor, ground_truth: torch.Tensor, obj_mask: torch.Tensor, best_bbox_mask: torch.Tensor):
         """
         Calculate the localization loss for the predicted 
         bounding box. 
         """
-
-        # self(x) shape is (batch_size, S * S * (B * 5 + C))
-        # num_samples = predictions.shape[0]
-        # outputs = torch.reshape(predictions, (num_samples, self.S, self.S, (self.B * 5 + self.C)))
-        # shape = (batch_size, S, S, 5B + C)
-    
-        # Convert (x, y) to relative to image from relative to grid cell
-        # pred_bboxes = self._convert_yolo_to_absolute(outputs)
-        # true_bboxes = self._convert_yolo_to_absolute(ground_truth)
-
-        # ious = self._get_iou(pred_bboxes, true_bboxes)
-        # Shape = (batch_size, S, S, B)
-
-        # Get the box with the highest IoU with the ground truth box. 
-        # Here, class does not matter
-        # mask = torch.argmax(ious, dim=-1).unsqueeze(-1)
-        # Shape = (batch_size, S, S, 1)
-
-        # pred_x = torch.gather(predictions[..., 0], dim=-1, index=object_present)
-        # pred_y = torch.gather(predictions[..., 1], dim=-1, index=object_present)
-        # true_x = torch.gather(ground_truth[..., 0], dim=-1, index=object_present)
-        # true_y = torch.gather(ground_truth[..., 1], dim=-1, index=object_present)
-
         pred_x = predictions[..., 0]
         pred_y = predictions[..., 1]
         true_x = ground_truth[..., 0]
         true_y = ground_truth[..., 1]
-
-        # loc_loss_x = torch.gather(true_x - pred_x, dim=-1, index=object_present) 
-        # loc_loss_y = torch.gather(true_y - pred_y, dim=-1, index=object_present)
+        # (N, S, S, B)
         
         loc_loss_x = true_x - pred_x
         loc_loss_y = true_y - pred_y
+        # (N, S, S, B)
 
-        # Only select grid locations which are responsible for detecting the 
-        # object.
+        # Only select grid cells that are responsible for detecting the object, by 
+        # only keeping those that have the highest IoU with the ground truth. Also,
+        # intersect with the mask for ground truth locations that actually have objs
         center_loss = torch.sum(
-            torch.gather(
+            torch.where(
+                obj_mask & best_bbox_mask, 
                 loc_loss_x ** 2 + loc_loss_y ** 2, 
-                dim=-1, 
-                index=object_present
+                0
             )
         )
-
 
         ## Calculate loss for box dimensions
         pred_w = torch.sqrt(predictions[..., 2])
         pred_h = torch.sqrt(predictions[..., 3])
         true_w = torch.sqrt(ground_truth[..., 2])
         true_h = torch.sqrt(ground_truth[..., 3])
+        # (N, S, S, B)
 
         loc_loss_w = true_w - pred_w
         loc_loss_h = true_h - pred_h
+        # (N, S, S, B)
 
         dimension_loss = torch.sum(
-            torch.gather(
+            torch.where(
+                obj_mask & best_bbox_mask,
                 loc_loss_w ** 2 + loc_loss_h ** 2, 
-                dim=-1, 
-                mask=object_present
+                0
             )
         )
 
         return self.lambda_coord * (center_loss + dimension_loss)
     
 
-    def confidence_loss(self, predictions: torch.Tensor, ground_truth: torch.Tensor, object_present: torch.Tensor):
+    def _confidence_loss(self, predictions: torch.Tensor, ground_truth: torch.Tensor, obj_mask: torch.Tensor, best_bbox_mask: torch.Tensor):
+        # Confidence loss. We only consider cells that are responsible for 
+        # detecting the object, and actually have an object. 
         obj_conf_loss = torch.sum(
-            torch.gather(
+            torch.where(
+                obj_mask & best_bbox_mask, 
                 (ground_truth - predictions) ** 2, 
-                dim=-1, 
-                index=object_present
+                0
             )
         )
 
-        # Create boolean mask for no object present in grid cell
-        grid = torch.arange(self.B).reshape((predictions.shape[0], self.S, self.S, self.B))
-        no_object_present = grid != object_present
-
+        # Consider cells that do not have objects, or those that have 
+        # boxes but are not responsible for detection because they are not 
+        # the best boxes.
         noobj_conf_loss = torch.sum(
             torch.where(
-                no_object_present == True, 
-                ground_truth - predictions, 
+                (~obj_mask) | (obj_mask & ~best_bbox_mask), 
+                (ground_truth - predictions) ** 2, 
                 0
             )
         )
 
         return obj_conf_loss + self.lambda_noobj * noobj_conf_loss
+    
+
+    def _classification_loss(self, predictions: torch.Tensor, ground_truth: torch.Tensor, obj_mask: torch.Tensor):
+
+        # For cells containing objects, we calculate the classification loss 
+        return torch.sum(
+            torch.where(
+                obj_mask, 
+                (ground_truth - predictions) ** 2, 
+                0
+            )
+        )
         
 
     def forward(self, x, *args, **kwargs):
@@ -199,57 +191,76 @@ class YoloV1(L.LightningModule):
 
         num_samples = outputs.shape[0]
         outputs = torch.reshape(outputs, (num_samples, self.S, self.S, (self.B * 5 + self.C)))
+        # Shape = (N, S, S, 5B + C)
 
         # Convert (x, y) to relative to image from relative to grid cell
         pred_bboxes = self._convert_yolo_to_absolute(outputs)
         true_bboxes = self._convert_yolo_to_absolute(y)
+        # (N, S, S, B, 4)
 
         ious = self._get_iou(pred_bboxes, true_bboxes)
+        # (N, S, S, B)
 
-        obj_present_mask = torch.argmax(ious, dim=-1).unsqueeze(-1)
+        grid = torch.arange(self.B).expand((num_samples, self.S, self.S, self.B))
+        best_bbox_index = torch.argmax(ious, dim=-1, keepdim=True)
+        best_bbox_mask = grid == best_bbox_index
+        # (N, S, S, B)
 
+        # Where confidence of ground truth == 1. Here, we follow Yolo V1's design
+        # and assume that each grid cell is responsible for detecting at most 1 object
+        obj_mask = (y[..., 4] == 1).unsqueeze(-1)
+        # (N, S, S, 1)        
+        # Not expanding here, so that torch can dynamically broadcast to whichever length, 
+        # as needed
 
-        localization_loss = self.localization_loss(
+        localization_loss = self._localization_loss(
             predictions=pred_bboxes, 
             ground_truth=true_bboxes, 
-            object_present=obj_present_mask
+            obj_mask=obj_mask,
+            best_bbox_mask=best_bbox_mask
         )
 
 
         pred_conf = outputs[..., 4:self.B * 5:5]
         true_conf = y[..., 4:self.B * 5:5]
-        confidence_loss = self.confidence_loss(
+        # (N, S, S, B)
+        confidence_loss = self._confidence_loss(
             predictions=pred_conf, 
             ground_truth=true_conf, 
-            object_present=obj_present_mask
+            obj_mask=obj_mask, 
+            best_bbox_mask=best_bbox_mask
         )
 
-        classification_loss = self.classification_loss()
+        pred_cls = outputs[..., self.B * 5:]
+        true_cls = y[..., self.B * 5:]
+        # (N, S, S, C)
+        classification_loss = self._classification_loss(
+            predictions=pred_cls, 
+            ground_truth=true_cls, 
+            obj_mask=obj_mask
+        )
+
+        train_loss = localization_loss + confidence_loss + classification_loss
+
+        self.log("train_loc_loss", localization_loss)
+        self.log("train_conf_loss", confidence_loss)
+        self.log("train_cls_loss", classification_loss)
+        # self.log("train_loss", train_loss)
+
+        return train_loss
     
 
-    def validation_step(self, batch, batch_idx, *args, **kwargs):
-        x, y = batch
-        outputs = self(x)
-
-        loc_loss = self.localization_loss(outputs, y)
-        conf_loss = self.confidence_loss(outputs, y)
-        prob_loss = self.class_probability_loss(outputs, y)
-        noobj_loss = self.no_object_loss(outputs, y)
-
-        # val_loss = (
-        #     self.loc_loss_weight * loc_loss + 
-        #     self.confidence_loss_weight * conf_loss + 
-        #     self.cls_prob_loss_weight * prob_loss + 
-        #     self.noobj_loss_weight * noobj_loss
-        # )
+    # def validation_step(self, batch, batch_idx, *args, **kwargs):
+    #     x, y = batch
+    #     outputs = self(x)
 
 
-    def test_step(self, batch, batch_idx):
-        images, bboxes = batch
+    # def test_step(self, batch, batch_idx):
+    #     images, bboxes = batch
 
-        preds = self(images)
+    #     preds = self(images)
         
-        # TODO: Build the rest of the test logic
+    #     # TODO: Build the rest of the test logic
 
     
     def configure_optimizers(self):
